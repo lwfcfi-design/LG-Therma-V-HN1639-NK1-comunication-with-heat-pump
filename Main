@@ -1,0 +1,398 @@
+# Board: WT32-ETH01 (Wireless-Tag)
+# Definition: definitions/boards/wt32-eth01/manifest.yaml
+
+esphome:
+  name: lg-therma-v
+  friendly_name: LG_Therma_V
+
+esp32:
+  variant: esp32
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+logger:
+  baud_rate: 0        # log off
+
+
+
+uart:
+  id: lg_uart
+  tx_pin: GPIO17
+  rx_pin: GPIO5
+  baud_rate: 300
+  data_bits: 8
+  stop_bits: 1
+  parity: NONE
+  debug:
+    direction: both
+    dummy_receiver: true
+    after:
+      bytes: 20
+    sequence:
+      - lambda: |-
+
+          if (bytes[0] != 0xC0) return;
+
+          uint8_t status = bytes[3];
+          uint8_t error  = bytes[15];
+
+          id(lg_compressor).publish_state(status & 0x02);
+          id(lg_defrost).publish_state(status & 0x04);
+          id(lg_cooling).publish_state(status & 0x20);
+
+          id(lg_error).publish_state(error != 0);
+
+          id(lg_error_code).publish_state(error);   
+
+          id(lg_setpoint).publish_state(bytes[8]);
+          id(lg_water_in).publish_state(bytes[11]);
+          id(lg_water_out).publish_state(bytes[12]);
+
+
+
+
+globals:
+  - id: stored_sp
+    type: uint8_t
+    restore_value: yes
+    initial_value: '50'
+
+
+
+api:
+  encryption:
+    key: "your_key"
+
+ota:
+  - platform: esphome
+
+ethernet:
+  clk:
+    mode: CLK_EXT_IN
+    pin: GPIO0
+  mdc_pin: GPIO23
+  mdio_pin: GPIO18
+  phy_addr: 1
+  power_pin: GPIO16
+  type: LAN8720
+  
+one_wire:
+  - platform: gpio
+    pin: GPIO4
+
+interval:
+  - interval: 20s
+    then:
+      - lambda: |-
+          
+          // =========================
+          // 1) ZJISTI REAL STAV LG
+          // =========================
+          bool lg_running = id(lg_cooling).state;   // nebo jiný bit pokud topení je jinde
+
+          // =========================
+          // 2) POŽADAVEK (HA / logika)
+          // =========================
+          bool demand = id(lg_heat).state;
+
+          // =========================
+          // 3) SYNCHRONIZACE
+          // =========================
+          if (demand && !lg_running) {
+            
+
+            uint8_t temp = id(stored_sp);
+
+            static const uint8_t crc_table[56] = {
+              0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+              0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+              0xC1,0xC0,0xC3,0xC2,0xCD,0xCC,0xCF,0xCE,
+              0xC9,0xC8,0xCB,0xCA,
+              0xF5,0xF4,0xF7,0xF6,
+              0xF1,0xF0,0xF3,0xF2,
+              0xFD,0xFC,0xFF,0xFE,
+              0xF9,0xF8,0xFB,0xFA,
+              0xE5,0xE4,0xE7,0xE6,
+              0xE1,0xE0,0xE3,0xE2
+            };
+
+            uint8_t crc = crc_table[temp];
+
+            std::vector<uint8_t> frame;
+
+            frame = {
+              0xA0,0x33,0x02,0x22,0x40,0x3C,0x00,0x00,
+              temp,
+              0x32,0x00,0x27,0x28,0xC3,0xC3,0x00,0x06,0x00,0x00,
+              crc
+            };
+
+            id(lg_uart).write_array(frame.data(), frame.size());
+            id(lg_uart).write_array(frame.data(), frame.size());
+          }
+
+          if (!demand && lg_running) {
+            
+
+            uint8_t off_cmd[] = {
+              0xA0,0x31,0x00,0x00,0x00,0x00,0x00,0x00,
+              0x37,0x32,0x00,0x00,0x00,0x00,0x00,0x00,
+              0x02,0x00,0x00,0x69
+            };
+
+            id(lg_uart).write_array(off_cmd, sizeof(off_cmd));
+            id(lg_uart).write_array(off_cmd, sizeof(off_cmd));
+          }
+
+          // =========================
+          // 4) SETPOINT SYNC 
+          // =========================
+          if (!demand) return;
+
+          uint8_t wanted = id(stored_sp);
+          uint8_t actual = (uint8_t) id(lg_setpoint).state;
+
+          if (wanted == actual) return;
+
+          static const uint8_t crc_table2[56] = {
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0xC1,0xC0,0xC3,0xC2,0xCD,0xCC,0xCF,0xCE,
+            0xC9,0xC8,0xCB,0xCA,
+            0xF5,0xF4,0xF7,0xF6,
+            0xF1,0xF0,0xF3,0xF2,
+            0xFD,0xFC,0xFF,0xFE,
+            0xF9,0xF8,0xFB,0xFA,
+            0xE5,0xE4,0xE7,0xE6,
+            0xE1,0xE0,0xE3,0xE2
+          };
+
+          uint8_t crc2 = crc_table2[wanted];
+
+          std::vector<uint8_t> frame2 = {
+            0xA0,0x33,0x02,0x22,0x40,0x3C,0x00,0x00,
+            wanted,
+            0x32,0x00,0x27,0x28,0xC3,0xC3,0x00,0x06,0x00,0x00,
+            crc2
+          };
+
+          id(lg_uart).write_array(frame2.data(), frame2.size());
+          id(lg_uart).write_array(frame2.data(), frame2.size());
+switch:
+  - platform: template
+    name: "LG Heat"
+    id: lg_heat
+    optimistic: true
+
+    turn_on_action:
+      - lambda: |-
+          static const uint8_t crc_table[56] = {
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+
+            0xC1,0xC0,0xC3,0xC2,0xCD,0xCC,0xCF,0xCE,
+            0xC9,0xC8,0xCB,0xCA,
+            0xF5,0xF4,0xF7,0xF6,
+            0xF1,0xF0,0xF3,0xF2,
+            0xFD,0xFC,0xFF,0xFE,
+            0xF9,0xF8,0xFB,0xFA,
+            0xE5,0xE4,0xE7,0xE6,
+            0xE1,0xE0,0xE3,0xE2
+          };
+
+          uint8_t temp = id(stored_sp);
+          uint8_t crc  = crc_table[temp];
+
+          std::vector<uint8_t> frame;
+
+          frame.push_back(0xA0);
+          frame.push_back(0x33);
+          frame.push_back(0x02);
+          frame.push_back(0x22);
+          frame.push_back(0x40);
+          frame.push_back(0x3C);
+          frame.push_back(0x00);
+          frame.push_back(0x00);
+
+          frame.push_back(temp);
+
+          frame.push_back(0x32);
+          frame.push_back(0x00);
+          frame.push_back(0x27);
+          frame.push_back(0x28);
+          frame.push_back(0xC3);
+          frame.push_back(0xC3);
+          frame.push_back(0x00);
+          frame.push_back(0x06);
+          frame.push_back(0x00);
+          frame.push_back(0x00);
+
+          frame.push_back(crc);
+
+          id(lg_uart).write_array(frame.data(), frame.size());
+          id(lg_uart).write_array(frame.data(), frame.size());
+
+    turn_off_action:
+      - uart.write: [0xA0,0x31,0x00,0x00,0x00,0x00,0x00,0x00,0x37,0x32,0x00,0x00,0x00,0x00,0x00,0x00,0x02,0x00,0x00,0x69]
+      - uart.write: [0xA0,0x31,0x00,0x00,0x00,0x00,0x00,0x00,0x37,0x32,0x00,0x00,0x00,0x00,0x00,0x00,0x02,0x00,0x00,0x69]
+
+#- uart.write: [0xA0,0x33,0x02,0x22,0x40,0x3C,0x00,0x00,0x32,0x32,0x00,0x27,0x28,0xC3,0xC3,0x00,0x06,0x00,0x00,0xE7]/ON 50°c
+number:
+  - platform: template
+    name: "LG Water Setpoint"
+    id: lg_sp
+    min_value: 20
+    max_value: 55
+    step: 1
+    optimistic: true
+
+    set_action:
+      - lambda: |-
+          id(stored_sp) = (uint8_t) x;
+
+          if (id(lg_heat).state) {
+
+            static const uint8_t crc_table[56] = {
+              0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+              0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+
+              0xC1,0xC0,0xC3,0xC2,0xCD,0xCC,0xCF,0xCE,
+              0xC9,0xC8,0xCB,0xCA,
+              0xF5,0xF4,0xF7,0xF6,
+              0xF1,0xF0,0xF3,0xF2,
+              0xFD,0xFC,0xFF,0xFE,
+              0xF9,0xF8,0xFB,0xFA,
+              0xE5,0xE4,0xE7,0xE6,
+              0xE1,0xE0,0xE3,0xE2
+            };
+
+            uint8_t temp = id(stored_sp);
+            uint8_t crc  = crc_table[temp];
+
+            std::vector<uint8_t> frame;
+
+            frame.push_back(0xA0);
+            frame.push_back(0x33);
+            frame.push_back(0x02);
+            frame.push_back(0x22);
+            frame.push_back(0x40);
+            frame.push_back(0x3C);
+            frame.push_back(0x00);
+            frame.push_back(0x00);
+
+            frame.push_back(temp);
+
+            frame.push_back(0x32);
+            frame.push_back(0x00);
+            frame.push_back(0x27);
+            frame.push_back(0x28);
+            frame.push_back(0xC3);
+            frame.push_back(0xC3);
+            frame.push_back(0x00);
+            frame.push_back(0x06);
+            frame.push_back(0x00);
+            frame.push_back(0x00);
+
+            frame.push_back(crc);
+
+            id(lg_uart).write_array(frame.data(), frame.size());
+            id(lg_uart).write_array(frame.data(), frame.size());
+          }
+
+binary_sensor:
+
+  - platform: template
+    name: "LG Compressor"
+    id: lg_compressor
+
+  - platform: template
+    name: "LG Defrost"
+    id: lg_defrost
+
+  - platform: template
+    name: "LG Cooling"
+    id: lg_cooling
+
+  - platform: template
+    name: "LG Error"
+    id: lg_error
+
+sensor:
+
+
+  - platform: dht
+    pin: GPIO2
+    model: AM2302
+    temperature:
+      name: "Kotelna T"
+    humidity:
+      name: "Kotelna Rh"
+    update_interval: 10s
+
+  - platform: template
+    name: "LG Error Code"
+    id: lg_error_code
+
+
+
+  - platform: template
+    name: "LG Setpoint"
+    id: lg_setpoint
+    unit_of_measurement: "°C"
+
+  - platform: template
+    name: "LG Water IN"
+    id: lg_water_in
+    unit_of_measurement: "°C"
+
+  - platform: template
+    name: "LG Water OUT"
+    id: lg_water_out
+    unit_of_measurement: "°C"
+
+
+  - platform: dallas_temp
+    id: inlet
+    name: inlet
+    accuracy_decimals: 3
+    update_interval: 5s
+    address: 0x653c790457af3e28
+
+  - platform: dallas_temp
+    id: outlet
+    name: outlet
+    accuracy_decimals: 3
+    update_interval: 5s
+    address: 0xaf0723b05b989228
+
+  - platform: template
+    id: diff
+    name: diff
+    icon: mdi:thermometer-chevron-up
+    unit_of_measurement: "°C"
+    accuracy_decimals: 2
+    update_interval: 5s
+    lambda: |-
+      if (isnan(id(inlet).state) || isnan(id(outlet).state)) {
+        return NAN;
+      }
+      return (id(outlet).state - id(inlet).state) + 0.31;
+
+  - platform: template
+    id: power_kw
+    name: heating_power
+    icon: mdi:flash
+    unit_of_measurement: "kW"
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: |-
+      if (!id(lg_heat).state) {
+        return NAN;
+      }
+
+      if (isnan(id(diff).state)) {
+        return NAN;
+      }
+
+      return 3.10 * (id(diff).state) + 0.03;
